@@ -1,0 +1,13 @@
+rules:
+  line_width: 1
+  clearance: 1
+  via_cost: 3.0
+  corner_cost: 0.2
+  step_cost: 0.01
+  violation_cost: 1.0
+  success_reward: 10.0
+
+env:
+  max_steps_factor: 1.0
+  enable_via: false
+  local_crop_sizes: [5, 9]

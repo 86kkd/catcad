@@ -1,0 +1,98 @@
+[build-system]
+requires = ["setuptools>=67,<81", "wheel"] # setuptools<81 is because of pygame
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "CatCAD"
+version = "0.1.0"
+description = "RL-based auto-router for PCBs with KiCad plugin"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "CatCAD Team" }
+]
+keywords = ["pcb", "routing", "reinforcement-learning", "kicad", "onnx"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Typing :: Typed",
+]
+dependencies = [
+  "numpy>=1.24",
+  "pyyaml>=6.0",
+  "onnx>=1.14",
+  "gymnasium>=1.1.1",
+  "stable-baselines3>=2.7.0",
+  "typer>=0.19.2",
+  "loguru>=0.7.3",
+  "rich>=14.1.0",
+  "pygame>=2.6.1",
+]
+
+[project.optional-dependencies]
+train = [
+  # Optional heavy deps; install when training
+  "torch>=2.2; platform_system != 'Darwin' or platform_machine != 'arm64'",
+  "pytorch-lightning>=2.2",
+]
+infer = [
+  "onnxruntime>=1.18",
+]
+log = [
+  "wandb>=0.17",
+  "mlflow>=2.14",
+]
+dev = [
+  "pytest>=7.4",
+  "ruff>=0.6.8",
+  "black>=24.8",
+  "mypy>=1.11",
+  "types-PyYAML>=6.0.12.20240808",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["auto_router*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+src = ["src"]
+extend-exclude = ["dist", "build"]
+select = ["E","F","I","UP","ANN","B","C4","SIM","NPY","RUF"]
+
+[tool.ruff.isort]
+known-first-party = ["auto_router"]
+
+[tool.mypy]
+python_version = "3.13"
+warn_unused_configs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_any_generics = true
+no_implicit_optional = true
+strict_equality = true
+show_error_codes = true
+pretty = true
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = ["src"]
+exclude = ["build", "dist", "scripts"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
+testpaths = ["tests"]
+filterwarnings = [
+  "ignore:pkg_resources is deprecated as an API.*:UserWarning:^pygame\\.pkgdata$",
+]

@@ -9,5 +9,6 @@ rules:
 
 env:
   max_steps_factor: 1.0
+  num_layers: 6
   enable_via: false
   local_crop_sizes: [5, 9]

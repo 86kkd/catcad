@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 # extras [viz]: pygame
-# 安装: uv pip install -e .[viz]
+# Install: uv pip install -e .[viz]
 import sys
 import time
 from collections.abc import Sequence
@@ -17,11 +17,11 @@ from rich.live import Live
 from rich.table import Table
 
 from auto_router.common.config import load_yaml
-from auto_router.env.snake_route_env import Actions, Rules, SnakeRouteEnv
+from auto_router.env import PcbRouteEnv, Rules
 
 app = typer.Typer(
     add_completion=False,
-    help="Human viewer: pygame 控制 Env, 终端以 Rich Live 刷新奖励表",
+    help="Human viewer: Control Env with pygame, refresh reward table in terminal with Rich Live",
 )
 console = Console()
 
@@ -49,8 +49,11 @@ def setup_logging(verbosity: int) -> None:
 class ViewerState:
     paused: bool = False
     target_fps: int = 30
-    last_action: int = Actions.STOP
     total_reward: float = 0.0
+    d_heading_idx: int = 1  # Corresponds to Δheading=0 ([-45,0,45])
+    step_len: int = 1  # Actual step length (1..max)
+    layer_target: int | None = None  # None means no switch; otherwise target layer index (0..L-1)
+    commit_next: bool = False
 
 
 def _build_env(
@@ -58,11 +61,10 @@ def _build_env(
     height: int,
     width: int,
     start: tuple[int, int],
-    goal: tuple[int, int],
+    goal_bbox: tuple[int, int, int, int],
     seed: int,
     max_steps: int | None,
-    enable_via: bool,
-) -> SnakeRouteEnv:
+) -> PcbRouteEnv:
     cfg = load_yaml(cfg_path)
     rules_cfg = cfg.get("rules", {})
     env_cfg = cfg.get("env", {})
@@ -70,16 +72,23 @@ def _build_env(
     if max_steps is None:
         max_steps = int(env_cfg.get("max_steps_factor", 1.0) * height * width)
 
-    env = SnakeRouteEnv(
+    num_layers = int(env_cfg.get("num_layers", 2))
+    via_budget = int(env_cfg.get("via_budget", 8))
+    via_cooldown = int(env_cfg.get("via_cooldown", 1))
+    max_step_len = int(env_cfg.get("max_step_len", 5))
+
+    env = PcbRouteEnv(
         height=height,
         width=width,
         start=start,
-        goal=goal,
+        goal_bbox=goal_bbox,
         obstacles=np.zeros((height, width), dtype=bool),
         rules=rules,
+        num_layers=num_layers,
+        via_budget=via_budget,
+        via_cooldown_steps=via_cooldown,
         max_steps=max_steps,
-        enable_via=enable_via,
-        local_crop_sizes=list(env_cfg.get("local_crop_sizes", [])),
+        max_step_len=max_step_len,
         seed=seed,
         render_mode="human",
     )
@@ -87,7 +96,7 @@ def _build_env(
 
 
 def _update_table(
-    env: SnakeRouteEnv, state: ViewerState, step_reward: float, info: dict[str, float]
+    env: PcbRouteEnv, state: ViewerState, step_reward: float, info: dict[str, float]
 ) -> Table:
     table = Table(title="Reward Live Stats", expand=True)
     table.add_column("Metric")
@@ -96,7 +105,10 @@ def _update_table(
     table.add_row("fps_target", str(state.target_fps))
     table.add_row("steps", str(env.steps))
     table.add_row("pos", str(env.pos))
-    table.add_row("last_action", str(state.last_action))
+    table.add_row("heading", str(getattr(env, "heading", 0)))
+    table.add_row("layer", str(getattr(env, "layer", 0)))
+    table.add_row("via_budget", str(getattr(env, "via_budget", 0)))
+    table.add_row("via_cooldown", str(getattr(env, "via_cooldown", 0)))
     table.add_row("step_reward", f"{step_reward:.3f}")
     table.add_row("total_reward", f"{state.total_reward:.3f}")
     if "dist_to_goal" in info:
@@ -105,61 +117,73 @@ def _update_table(
     return table
 
 
-def _keymap_to_action(pressed: Sequence[bool], enable_via: bool) -> int | None:
-    # 基础方向键
+def _gather_head_choices(
+    pressed: Sequence[bool],
+    state: ViewerState,
+    max_step_len: int,
+    num_layers: int,
+) -> tuple[int, int, int, int]:
     import pygame
 
-    # 对角: Q/E/Z/C; 方向: 箭头或 WASD
-    up = pressed[pygame.K_UP] or pressed[pygame.K_w]
-    down = pressed[pygame.K_DOWN] or pressed[pygame.K_s]
-    left = pressed[pygame.K_LEFT] or pressed[pygame.K_a]
-    right = pressed[pygame.K_RIGHT] or pressed[pygame.K_d]
+    # Δheading selection: left/right for -45/+45, up or W for 0
+    d_idx = state.d_heading_idx
+    if pressed[pygame.K_LEFT]:
+        d_idx = 0  # -45 corresponds to index 0 ([-45,0,45])
+    elif pressed[pygame.K_RIGHT]:
+        d_idx = 2  # +45 corresponds to index 2 ([-45,0,45])
+    elif pressed[pygame.K_UP] or pressed[pygame.K_w]:
+        d_idx = 1  # 0 corresponds to index 1 ([-45,0,45])
 
-    ul = pressed[pygame.K_q]
-    ur = pressed[pygame.K_e]
-    dl = pressed[pygame.K_z]
-    dr = pressed[pygame.K_c]
+    # Step length: number keys 1..9, limited to max_step_len
+    step_len = state.step_len
+    for key_num, val in (
+        (pygame.K_1, 1),
+        (pygame.K_2, 2),
+        (pygame.K_3, 3),
+        (pygame.K_4, 4),
+        (pygame.K_5, 5),
+        (pygame.K_6, 6),
+        (pygame.K_7, 7),
+        (pygame.K_8, 8),
+        (pygame.K_9, 9),
+    ):
+        if pressed[key_num]:
+            step_len = min(val, max_step_len)
+            break
 
-    if ul or (up and left):
-        return Actions.UP_LEFT
-    if ur or (up and right):
-        return Actions.UP_RIGHT
-    if dl or (down and left):
-        return Actions.DOWN_LEFT
-    if dr or (down and right):
-        return Actions.DOWN_RIGHT
-    if up and not down:
-        return Actions.UP
-    if down and not up:
-        return Actions.DOWN
-    if left and not right:
-        return Actions.LEFT
-    if right and not left:
-        return Actions.RIGHT
-    if enable_via and pressed[pygame.K_v]:
-        return Actions.VIA
-    return None
+    # Layer switch: state.layer_target is set in KEYDOWN event loop
+    layer_sel = 0
+    if state.layer_target is not None:
+        layer_sel = state.layer_target + 1  # env encoding: 1..L
+
+    # commit: set once on KEYDOWN Enter
+    commit = 1 if state.commit_next else 0
+
+    return d_idx, step_len, layer_sel, commit
 
 
 @app.command()
 def run(
     cfg: Path = typer.Option(  # noqa: B008
-        Path("configs/default.yaml"), "--cfg", help="YAML 配置文件路径"
+        Path("configs/default.yaml"), "--cfg", help="Path to YAML config file"
     ),
-    height: int = typer.Option(100, help="网格高度 H"),
-    width: int = typer.Option(100, help="网格宽度 W"),
-    start_y: int = typer.Option(0, help="起点 Y"),
-    start_x: int = typer.Option(0, help="起点 X"),
-    goal_y: int = typer.Option(-1, help="终点 Y, -1 表示 H-1"),
-    goal_x: int = typer.Option(-1, help="终点 X, -1 表示 W-1"),
-    seed: int = typer.Option(42, help="随机种子"),
-    enable_via: bool = typer.Option(False, help="启用 VIA 动作(演示用途)"),
-    verbosity: int = typer.Option(1, "-v", count=True, help="日志详细程度"),
+    height: int = typer.Option(100, help="Grid height H"),
+    width: int = typer.Option(100, help="Grid width W"),
+    start_y: int = typer.Option(0, help="Start point Y"),
+    start_x: int = typer.Option(0, help="Start point X"),
+    goal_y: int = typer.Option(-1, help="Goal Y, -1 means H-1"),
+    goal_x: int = typer.Option(-1, help="Goal X, -1 means W-1"),
+    seed: int = typer.Option(42, help="Random seed"),
+    enable_via: bool = typer.Option(False, help="(Reserved parameter)"),
+    verbosity: int = typer.Option(1, "-v", count=True, help="Log verbosity level"),
 ) -> None:
-    """基于 pygame 的人类控制器: 非阻塞键盘映射 Env 动作, Rich Live 实时表格。"""
+    """Human viewer using pygame.
+
+    Non-blocking keyboard controls and Rich Live stats table.
+    """
     setup_logging(verbosity)
 
-    # 仅在需要时导入 pygame, 给出清晰的安装与无显示环境指引
+    # Only import pygame when needed, provide clear installation and headless environment guidance
     try:
         import warnings
 
@@ -172,35 +196,36 @@ def run(
             )
             import pygame
     except ImportError as exc:
-        raise RuntimeError("需要安装 pygame; 执行 uv pip install -e .[viz]") from exc
+        raise RuntimeError("pygame required; run: uv pip install -e .[viz]") from exc
 
     gy = goal_y if goal_y >= 0 else (height - 1)
     gx = goal_x if goal_x >= 0 else (width - 1)
     start = (int(start_y), int(start_x))
-    goal = (int(gy), int(gx))
+    goal_bbox = (int(gy), int(gx), int(gy), int(gx))
 
     env = _build_env(
         cfg_path=cfg,
         height=height,
         width=width,
         start=start,
-        goal=goal,
+        goal_bbox=goal_bbox,
         seed=seed,
         max_steps=None,
-        enable_via=enable_via,
     )
     env.reset()
-    # 先进行一次渲染, 确保 pygame 显卡子系统和窗口已初始化,
-    # 防止事件获取时报 "video system not initialized"
+    # Render once first to ensure pygame video system and window are initialized,
+    # preventing "video system not initialized" error during event handling
     env.render()
 
-    state = ViewerState(paused=False, target_fps=30, last_action=Actions.STOP, total_reward=0.0)
+    state = ViewerState(paused=False, target_fps=30, total_reward=0.0)
     clock = pygame.time.Clock()
 
     console.rule("[bold green]Human Viewer — Controls")
     console.print(
-        "ESC 退出 | R 重置 | SPACE 暂停/继续 | +/- 调整速度 | "
-        "方向键/WASD/QEZC 控制方向 | V 经由(VIA)"
+        "ESC to quit | R to reset | SPACE to pause/resume | +/- adjust speed\n"
+        "Direction: ← -45 / ↑(or W) straight / → +45 | Numbers 1-9 select step length\n"
+        "TAB cycle target layer(if legal) | ENTER commit(only available at goal)\n"
+        "Tip: 90° turns can be achieved by two consecutive 45° turns"
     )
 
     step_reward = 0.0
@@ -213,7 +238,7 @@ def run(
     ) as live:
         running = True
         while running:
-            # 非阻塞事件处理
+            # Non-blocking event handling
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -225,33 +250,75 @@ def run(
                         state.total_reward = 0.0
                         step_reward = 0.0
                         info = {}
+                        state.layer_target = None
+                        state.commit_next = False
                     elif event.key == pygame.K_SPACE:
                         state.paused = not state.paused
                     elif event.key in (pygame.K_PLUS, pygame.K_EQUALS):
                         state.target_fps = min(240, state.target_fps + 5)
                     elif event.key == pygame.K_MINUS:
                         state.target_fps = max(1, state.target_fps - 5)
+                    elif event.key == pygame.K_TAB:
+                        # Cycle through target layers (not applied immediately)
+                        current = getattr(env, "layer", 0)
+                        L = int(getattr(env, "num_layers", 2))
+                        if state.layer_target is None:
+                            state.layer_target = (current + 1) % L
+                        else:
+                            state.layer_target = (state.layer_target + 1) % L
+                        if state.layer_target == current:
+                            # Avoid selecting current layer, advance one more
+                            state.layer_target = (state.layer_target + 1) % L
+                    elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                        state.commit_next = True
 
             pressed = pygame.key.get_pressed()
-            action = _keymap_to_action(pressed, enable_via)
-            if action is None:
-                action = state.last_action  # 保持上一次动作
-            else:
-                state.last_action = action
+            # Read masks, select by head parts and fallback if illegal
+            masks = env.get_action_masks()
+            d_idx, step_len, layer_sel, commit = _gather_head_choices(
+                pressed, state, getattr(env, "max_step_len", 5), getattr(env, "num_layers", 2)
+            )
 
+            # Correct to legal mask values
+            # Legalize Δheading: only allow 0(-45), 1(straight), 2(+45)
+            if not (0 <= int(d_idx) < len(masks["d_heading"])):
+                d_idx = 1
+
+            step_len = int(step_len)
+            step_mask = masks["step_len"]
+            if step_len >= len(step_mask) or step_mask[step_len] == 0:
+                # Selection illegal, find nearest available <= target step length
+                legal = [i for i in range(1, len(step_mask)) if step_mask[i] == 1]
+                step_len = legal[-1] if legal else 1
+
+            layer_sel = int(layer_sel)
+            layer_mask = masks["layer_change"]
+            if layer_sel >= len(layer_mask) or layer_mask[layer_sel] == 0:
+                layer_sel = 0
+
+            commit_mask = masks["commit"]
+            if commit == 1 and commit_mask[1] != 1:
+                commit = 0
+
+            # Execute action
             if not state.paused:
-                _, r, terminated, truncated, info = env.step(int(action))
+                _, r, terminated, truncated, info = env.step(
+                    (int(d_idx), int(step_len - 1), int(layer_sel), int(commit))
+                )
                 step_reward = float(r)
                 state.total_reward += step_reward
+                state.d_heading_idx = d_idx
+                state.step_len = step_len
+                # commit is one-time
+                state.commit_next = False
                 if terminated or truncated:
-                    # 结束后保持当前画面, 并进入暂停
                     state.paused = True
 
-            # 渲染(交给 env), 刷新终端表
+            # Render (handled by env), refresh terminal table
             env.render()
             live.update(_update_table(env, state, step_reward, info))
 
-            # 速度控制: 尽量靠近目标 FPS
+            # Speed control: try to match target FPS
             try:
                 clock.tick(state.target_fps)
             except Exception:

@@ -326,17 +326,16 @@ class PcbRouteEnv(gym.Env):
         saved_clearance = int(self.rules.clearance)
         tmp_clearance = max(saved_clearance, lw - 1)
 
-        # Temporary modification check
-        class _Tmp:
-            pass
-
-        # Quick local check
+        # Quick local check (ignore current cell occupancy to allow forward extension)
         cl = tmp_clearance
         y0 = max(0, y - cl)
         y1 = min(self.height - 1, y + cl)
         x0 = max(0, x - cl)
         x1 = min(self.width - 1, x + cl)
-        region = self.occ[layer, y0 : y1 + 1, x0 : x1 + 1]
+        region = self.occ[layer, y0 : y1 + 1, x0 : x1 + 1].copy()
+        # Clear current position if it lies within the checked region
+        if y0 <= self.y <= y1 and x0 <= self.x <= x1:
+            region[self.y - y0, self.x - x0] = False
         return not bool(region.any())
 
     def _can_move_L(self, L: int) -> bool:

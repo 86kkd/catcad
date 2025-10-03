@@ -126,7 +126,8 @@ def _gather_head_choices(
     import pygame
 
     # Δheading selection: left/right for -45/+45, up or W for 0
-    d_idx = state.d_heading_idx
+    # Momentary control: default to straight each frame unless a key is pressed
+    d_idx = 1  # 0:-45, 1:0, 2:+45
     if pressed[pygame.K_LEFT]:
         d_idx = 0  # -45 corresponds to index 0 ([-45,0,45])
     elif pressed[pygame.K_RIGHT]:
@@ -282,6 +283,9 @@ def run(
             # Correct to legal mask values
             # Legalize Δheading: only allow 0(-45), 1(straight), 2(+45)
             if not (0 <= int(d_idx) < len(masks["d_heading"])):
+                d_idx = 1
+            elif masks["d_heading"][int(d_idx)] != 1:
+                # Fallback to straight if chosen turn masked (shouldn't happen; all ones now)
                 d_idx = 1
 
             step_len = int(step_len)

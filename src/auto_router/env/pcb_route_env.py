@@ -99,6 +99,8 @@ class PcbRouteEnv(gym.Env):
         else:
             assert obstacles.shape == (self.height, self.width)
             self.occ = np.repeat(obstacles[None, :, :], self.num_layers, axis=0)
+        # Track sites where a via has been created to avoid double-charging budget
+        self.via_sites = np.zeros((self.height, self.width), dtype=bool)
 
         # Gym spaces (for training alignment). Note: step accepts tuple form
         self.action_space = spaces.Dict(
@@ -159,6 +161,8 @@ class PcbRouteEnv(gym.Env):
         self._truncated = False
         # Path occupancy: Mark starting point
         self.occ[self.layer, self.y, self.x] = True
+        # Reset via sites
+        self.via_sites[:, :] = False
         obs = self._get_obs()
         info = self._get_info()
         return obs, info
@@ -202,11 +206,15 @@ class PcbRouteEnv(gym.Env):
         layer_sel = int(action["layer_change"])
         if layer_sel != 0 and masks["layer_change"][layer_sel] == 1:
             target_layer = layer_sel - 1
+            # Only charge budget when creating a new via at this (y,x)
             if target_layer != self.layer:
+                creating_new_via = not bool(self.via_sites[self.y, self.x])
                 self.layer = target_layer
-                self.via_budget -= 1
-                self.via_cooldown = self.via_cooldown_init
-                reward -= float(self.rules.via_cost)
+                if creating_new_via:
+                    self.via_sites[self.y, self.x] = True
+                    self.via_budget -= 1
+                    self.via_cooldown = self.via_cooldown_init
+                    reward -= float(self.rules.via_cost)
 
         # Update heading before movement (rotation before movement)
         self.heading = new_heading

@@ -95,10 +95,13 @@ class PcbRouteEnv(gym.Env):
 
         # Grid occupancy: (layers, H, W) boolean array
         if obstacles is None:
-            self.occ = np.zeros((self.num_layers, self.height, self.width), dtype=bool)
+            base_occ = np.zeros((self.num_layers, self.height, self.width), dtype=bool)
         else:
             assert obstacles.shape == (self.height, self.width)
-            self.occ = np.repeat(obstacles[None, :, :], self.num_layers, axis=0)
+            base_occ = np.repeat(obstacles[None, :, :], self.num_layers, axis=0)
+        # Keep a pristine copy of static obstacles to rebuild occupancy on reset
+        self._static_occ = base_occ.copy()
+        self.occ = base_occ.copy()
         # Track sites where a via has been created to avoid double-charging budget
         self.via_sites = np.zeros((self.height, self.width), dtype=bool)
 
@@ -150,6 +153,8 @@ class PcbRouteEnv(gym.Env):
         super().reset(seed=seed)
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+        # Rebuild occupancy: keep static obstacles, drop previous trajectories
+        self.occ = self._static_occ.copy()
         self.y, self.x = self.start
         self.heading = 0  # Initial heading is right
         self.layer = 0

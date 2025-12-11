@@ -76,6 +76,9 @@ class PcbRouteEnv(gym.Env):
         via_cooldown_steps: int = 1,
         max_steps: int | None = None,
         max_step_len: int = 5,
+        random_start: bool = True,
+        random_goal: bool = True,
+        goal_bbox_size: int = 1,
         seed: int | None = None,
         render_mode: str | None = None,
     ) -> None:
@@ -84,6 +87,7 @@ class PcbRouteEnv(gym.Env):
         self.height = int(height)
         self.width = int(width)
         self.start = (int(start[0]), int(start[1]))
+        self.goal_bbox_init = goal_bbox
         self.goal_bbox = goal_bbox
         self.rules = rules
         self.num_layers = int(num_layers)
@@ -91,6 +95,9 @@ class PcbRouteEnv(gym.Env):
         self.via_cooldown_init = int(via_cooldown_steps)
         self.max_steps = int(max_steps) if max_steps is not None else height * width
         self.max_step_len = max(1, int(max_step_len))
+        self.random_start = bool(random_start)
+        self.random_goal = bool(random_goal)
+        self.goal_bbox_size = max(1, int(goal_bbox_size))
         self.render_mode = render_mode
 
         # Grid occupancy: (layers, H, W) boolean array
@@ -131,7 +138,17 @@ class PcbRouteEnv(gym.Env):
             ],
             dtype=np.int32,
         )
-        self.observation_space = spaces.Box(low=low, high=high, dtype=np.int32)
+        self.observation_space = spaces.Dict(
+            {
+                "grid": spaces.Box(
+                    low=0,
+                    high=1,
+                    shape=(self.num_layers + 1, self.height, self.width),
+                    dtype=np.int8,
+                ),  # [layers..., goal_mask]
+                "state": spaces.Box(low=low, high=high, dtype=np.int32),
+            }
+        )
 
         self._pygame: Any | None = None  # Lazy import
 
@@ -149,10 +166,14 @@ class PcbRouteEnv(gym.Env):
     # ------- Core logic -------
     def reset(
         self, *, seed: int | None = None, options: dict[str, Any] | None = None
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         super().reset(seed=seed)
         if seed is not None:
             self.rng = np.random.default_rng(seed)
+        # Randomize goal/start if enabled
+        self.goal_bbox = self._sample_goal_bbox() if self.random_goal else self.goal_bbox_init
+        if self.random_start:
+            self.start = self._sample_start_pos()
         # Rebuild occupancy: keep static obstacles, drop previous trajectories
         self.occ = self._static_occ.copy()
         self.y, self.x = self.start
@@ -174,7 +195,7 @@ class PcbRouteEnv(gym.Env):
 
     def step(
         self, action: Mapping[str, int] | tuple[int, int, int, int]
-    ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
+    ) -> tuple[dict[str, np.ndarray], float, bool, bool, dict[str, Any]]:
         if isinstance(action, tuple):
             d_idx, step_len_raw, layer_sel, commit = action
             action = {
@@ -320,6 +341,41 @@ class PcbRouteEnv(gym.Env):
     def _is_oob(self, y: int, x: int) -> bool:
         return not (0 <= y < self.height and 0 <= x < self.width)
 
+    def _sample_free_cell(self, forbidden: set[tuple[int, int]] | None = None) -> tuple[int, int]:
+        # Sample a free cell that is not occupied by static obstacles and not in forbidden.
+        free_mask = ~self._static_occ.any(axis=0)
+        if forbidden:
+            for fy, fx in forbidden:
+                if 0 <= fy < self.height and 0 <= fx < self.width:
+                    free_mask[fy, fx] = False
+        coords = np.argwhere(free_mask)
+        if coords.size == 0:
+            raise ValueError("No free cells available for sampling.")
+        idx = self.rng.integers(0, len(coords))
+        cy, cx = coords[idx].tolist()
+        return int(cy), int(cx)
+
+    def _bbox_from_center(self, center: tuple[int, int]) -> tuple[int, int, int, int]:
+        cy, cx = center
+        half = (self.goal_bbox_size - 1) // 2
+        y0 = max(0, cy - half)
+        x0 = max(0, cx - half)
+        y1 = min(self.height - 1, cy + half)
+        x1 = min(self.width - 1, cx + half)
+        return (y0, x0, y1, x1)
+
+    def _sample_goal_bbox(self) -> tuple[int, int, int, int]:
+        center = self._sample_free_cell()
+        return self._bbox_from_center(center)
+
+    def _sample_start_pos(self) -> tuple[int, int]:
+        # Avoid placing start inside the goal bbox
+        gy0, gx0, gy1, gx1 = self.goal_bbox
+        forbidden: set[tuple[int, int]] = {
+            (yy, xx) for yy in range(gy0, gy1 + 1) for xx in range(gx0, gx1 + 1)
+        }
+        return self._sample_free_cell(forbidden=forbidden)
+
     def _clearance_ok(self, y: int, x: int, layer: int) -> bool:
         # Simplified: check existing occupancy within Manhattan/chess distance clearance
         cl = int(self.rules.clearance)
@@ -365,11 +421,17 @@ class PcbRouteEnv(gym.Env):
                 return False
         return True
 
-    def _get_obs(self) -> np.ndarray:
-        return np.array(
+    def _get_obs(self) -> dict[str, np.ndarray]:
+        grid = np.zeros((self.num_layers + 1, self.height, self.width), dtype=np.int8)
+        grid[: self.num_layers] = self.occ.astype(np.int8)
+        y0, x0, y1, x1 = self.goal_bbox
+        grid[-1, y0 : y1 + 1, x0 : x1 + 1] = 1
+
+        state = np.array(
             [self.y, self.x, self.heading, self.layer, self.via_budget, self.via_cooldown],
             dtype=np.int32,
         )
+        return {"grid": grid, "state": state}
 
     def _get_info(self) -> dict[str, Any]:
         return {
